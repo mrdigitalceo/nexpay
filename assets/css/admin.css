@@ -1,0 +1,242 @@
+/**
+ * NexPay — admin overview page styles.
+ * Design: purple gradient band (#4C1D95 → #6D28D9 → #7C3AED), white cards,
+ * brand badges, green/amber Live & Sandbox pills. Light mode.
+ */
+
+.nexpay-admin {
+	--nexpay-violet: #6d28d9;
+	--nexpay-violet-dark: #4c1d95;
+	--nexpay-violet-bright: #7c3aed;
+	--nexpay-ink: #1d2327;
+	--nexpay-muted: #6e6890;
+	max-width: 1200px;
+}
+
+/* ---- Header band ------------------------------------------------------- */
+.nexpay-band {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	margin-top: 18px;
+	padding: 18px 22px;
+	border-radius: 12px;
+	color: #fff;
+	background: linear-gradient(90deg, var(--nexpay-violet-dark), var(--nexpay-violet) 60%, var(--nexpay-violet-bright));
+	box-shadow: 0 4px 16px rgba(76, 29, 149, 0.25);
+}
+
+.nexpay-band__globe {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 42px;
+	height: 42px;
+	border-radius: 11px;
+	background: rgba(255, 255, 255, 0.16);
+	flex: none;
+}
+
+.nexpay-band__title {
+	margin: 0;
+	padding: 0;
+	color: #fff;
+	font-size: 21px;
+	font-weight: 600;
+	line-height: 1.25;
+}
+
+.nexpay-band__docs {
+	margin-left: auto;
+	padding: 6px 14px;
+	border: 1.5px solid rgba(255, 255, 255, 0.55);
+	border-radius: 8px;
+	color: #fff;
+	font-size: 12.5px;
+	font-weight: 600;
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+.nexpay-band__docs:hover,
+.nexpay-band__docs:focus {
+	color: #fff;
+	background: rgba(255, 255, 255, 0.12);
+}
+
+.nexpay-band__version {
+	padding: 6px 13px;
+	border-radius: 8px;
+	background: #fff;
+	color: #5b21b6;
+	font-size: 12.5px;
+	font-weight: 700;
+	white-space: nowrap;
+}
+
+.nexpay-desc {
+	margin: 16px 2px 14px;
+	font-size: 13.5px;
+	color: #50575e;
+}
+
+/* ---- Card + table ------------------------------------------------------ */
+.nexpay-card {
+	padding: 20px 22px;
+	border: 1px solid #dfe1e6;
+	border-radius: 12px;
+	background: #fff;
+}
+
+.nexpay-card__title {
+	margin: 0 0 6px;
+	font-size: 16px;
+	font-weight: 600;
+	color: var(--nexpay-ink);
+}
+
+.nexpay-table {
+	width: 100%;
+	border-collapse: collapse;
+}
+
+.nexpay-table th {
+	padding: 10px 8px;
+	border-bottom: 1px solid #eceaf4;
+	color: #8a84a3;
+	font-size: 11px;
+	letter-spacing: 1.2px;
+	text-align: left;
+	text-transform: uppercase;
+}
+
+.nexpay-table td {
+	padding: 13px 8px;
+	border-bottom: 1px solid #f0eef7;
+	font-size: 13.5px;
+	vertical-align: middle;
+}
+
+.nexpay-table tbody tr:last-child td {
+	border-bottom: none;
+}
+
+/* ---- Brand badges (shared with checkout.css) ---------------------------- */
+.nexpay-badge {
+	display: inline-block;
+	padding: 5px 12px;
+	border-radius: 7px;
+	color: #fff;
+	font-size: 12px;
+	font-weight: 700;
+	line-height: 1.4;
+}
+
+.nexpay-badge--nexpay_jazzcash  { background: #a6192e; }
+.nexpay-badge--nexpay_easypaisa { background: #3fa34d; }
+.nexpay-badge--nexpay_bkash     { background: #e2136e; }
+.nexpay-badge--nexpay_nagad     { background: #ee4023; }
+.nexpay-badge--nexpay_upi       { background: #3d4ead; }
+.nexpay-badge--nexpay_mpesa     { background: #43b02a; }
+
+/* ---- Country code squares ---------------------------------------------- */
+.nexpay-cc {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 26px;
+	height: 19px;
+	margin-right: 8px;
+	border-radius: 4px;
+	color: #fff;
+	font-size: 9.5px;
+	font-weight: 700;
+	vertical-align: -4px;
+}
+
+.nexpay-cc--pk { background: #0b6e4f; }
+.nexpay-cc--bd { background: #006a4e; }
+.nexpay-cc--in { background: #2e5aac; }
+.nexpay-cc--ke { background: #7a1f1f; }
+
+/* ---- Enabled toggle (display only — the real switch lives in settings) -- */
+.nexpay-toggle {
+	position: relative;
+	display: inline-block;
+	width: 42px;
+	height: 23px;
+	margin-right: 8px;
+	border-radius: 20px;
+	background: #c9c2e4;
+	vertical-align: -6px;
+}
+
+.nexpay-toggle::after {
+	content: "";
+	position: absolute;
+	top: 3px;
+	left: 3px;
+	width: 17px;
+	height: 17px;
+	border-radius: 50%;
+	background: #fff;
+}
+
+.nexpay-toggle.is-on {
+	background: #22a35a;
+}
+
+.nexpay-toggle.is-on::after {
+	left: 22px;
+}
+
+/* ---- Mode pills ---------------------------------------------------------- */
+.nexpay-mode {
+	display: inline-block;
+	padding: 4px 11px;
+	border-radius: 14px;
+	font-size: 11px;
+	font-weight: 700;
+}
+
+.nexpay-mode--live {
+	background: #e5f6ec;
+	color: #15803d;
+}
+
+.nexpay-mode--sandbox {
+	background: #fdf0dc;
+	color: #b45309;
+}
+
+/* ---- Configure button ---------------------------------------------------- */
+.nexpay-configure {
+	display: inline-block;
+	padding: 7px 15px;
+	border-radius: 8px;
+	background: var(--nexpay-violet);
+	color: #fff;
+	font-size: 12.5px;
+	font-weight: 600;
+	text-decoration: none;
+}
+
+.nexpay-configure:hover,
+.nexpay-configure:focus {
+	background: var(--nexpay-violet-dark);
+	color: #fff;
+}
+
+/* ---- Footer ---------------------------------------------------------------- */
+.nexpay-foot {
+	display: flex;
+	align-items: center;
+	margin-top: 18px;
+	font-size: 12px;
+	color: #787c82;
+}
+
+.nexpay-foot__logo {
+	margin-left: auto;
+	border-radius: 6px;
+}

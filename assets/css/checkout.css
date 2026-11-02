@@ -1,0 +1,123 @@
+/**
+ * NexPay — checkout styles (classic WooCommerce checkout).
+ * Design: gateway rows with radio circles, the selected NexPay row gets a
+ * violet border + light violet background, brand badges float right, and
+ * the gateway fields are clean rounded inputs.
+ */
+
+/* Gateway rows in the payment methods list */
+.woocommerce-checkout #payment ul.payment_methods li.nexpay-method {
+	border: 1.5px solid #e4e0f2;
+	border-radius: 12px;
+	padding: 12px 16px;
+	margin-bottom: 10px;
+	background: #fff;
+	transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.woocommerce-checkout #payment ul.payment_methods li.nexpay-method > label {
+	display: flex;
+	align-items: center;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+/* Selected state (JS adds .nexpay-selected; :has() covers modern browsers) */
+.woocommerce-checkout #payment ul.payment_methods li.nexpay-method.nexpay-selected,
+.woocommerce-checkout #payment ul.payment_methods li.nexpay-method:has(> input[type="radio"]:checked) {
+	border-color: #6d28d9;
+	background: #f7f3ff;
+}
+
+/* Brand badges, appended to the gateway title by NexPay_Gateway::get_title() */
+.nexpay-badge {
+	margin-left: auto;
+	padding: 4px 10px;
+	border-radius: 7px;
+	color: #fff;
+	font-size: 11px;
+	font-weight: 700;
+	line-height: 1.5;
+	white-space: nowrap;
+}
+
+.nexpay-badge--nexpay_jazzcash  { background: #a6192e; }
+.nexpay-badge--nexpay_easypaisa { background: #3fa34d; }
+.nexpay-badge--nexpay_bkash     { background: #e2136e; }
+.nexpay-badge--nexpay_nagad     { background: #ee4023; }
+.nexpay-badge--nexpay_upi       { background: #3d4ead; }
+.nexpay-badge--nexpay_mpesa     { background: #43b02a; }
+
+/* Gateway payment box */
+.woocommerce-checkout #payment .payment_box.payment_method_nexpay_jazzcash,
+.woocommerce-checkout #payment .payment_box.payment_method_nexpay_easypaisa,
+.woocommerce-checkout #payment .payment_box.payment_method_nexpay_bkash,
+.woocommerce-checkout #payment .payment_box.payment_method_nexpay_nagad,
+.woocommerce-checkout #payment .payment_box.payment_method_nexpay_upi,
+.woocommerce-checkout #payment .payment_box.payment_method_nexpay_mpesa {
+	background: transparent;
+	color: inherit;
+	margin: 10px 0 2px;
+	padding: 4px 2px 0;
+}
+
+.woocommerce-checkout #payment .payment_box[class*="payment_method_nexpay_"]::before {
+	display: none; /* Hide the default speech-bubble arrow. */
+}
+
+/* Gateway input fields */
+.nexpay-field label {
+	display: block;
+	margin-bottom: 7px;
+	font-size: 12.5px;
+	font-weight: 600;
+	color: #3e3860;
+}
+
+.nexpay-field .nexpay-input {
+	width: 100%;
+	height: 43px;
+	padding: 0 13px;
+	border: 1.5px solid #ddd9ec;
+	border-radius: 9px;
+	background: #fff;
+	font-size: 14px;
+}
+
+.nexpay-field .nexpay-input:focus {
+	border-color: #6d28d9;
+	outline: none;
+	box-shadow: 0 0 0 3px rgba(109, 40, 217, 0.15);
+}
+
+/* Test mode note */
+.nexpay-testmode-note {
+	margin: 0 0 10px;
+	padding: 8px 12px;
+	border-radius: 8px;
+	background: #fdf0dc;
+	color: #b45309;
+	font-size: 12.5px;
+	font-weight: 600;
+}
+
+/* UPI thank-you box */
+.nexpay-upi-box {
+	margin: 24px 0;
+	padding: 22px 24px;
+	border: 1.5px solid #6d28d9;
+	border-radius: 14px;
+	background: #f7f3ff;
+}
+
+.nexpay-upi-box .nexpay-upi-pay-button {
+	background: linear-gradient(90deg, #6d28d9, #7c3aed);
+	border: none;
+	color: #fff;
+	font-weight: 600;
+}
+
+.nexpay-upi-payload code {
+	word-break: break-all;
+	font-size: 12.5px;
+}

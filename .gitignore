@@ -1,0 +1,18 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+*.zip
+dist/
+
+# Dependencies (none at runtime; keep the repo clean anyway)
+vendor/
+node_modules/
+
+# Local environment
+.env
+*.log
