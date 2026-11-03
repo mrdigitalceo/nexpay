@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       NexPay — Multi-Country Payment Gateways for WooCommerce
  * Plugin URI:        https://github.com/mrdigitalceo/nexpay
- * Description:       Free, open-source multi-country payment gateways for WooCommerce. Accept JazzCash &amp; Easypaisa (Pakistan), bKash &amp; Nagad (Bangladesh), UPI (India) and M-Pesa (Kenya) — with live/sandbox test modes and secure, hash-verified callbacks.
- * Version:           1.0.0
+ * Description:       Free, open-source multi-country payment gateways for WooCommerce. Accept JazzCash &amp; Easypaisa (Pakistan), bKash &amp; Nagad (Bangladesh), UPI (India) and M-Pesa (Kenya) — with live/sandbox test modes and provider-verified callbacks.
+ * Version:           1.1.0
  * Author:            Mr Arslan CEO
  * Author URI:        https://mrarslanceo.site
  * License:           GPL-2.0-or-later
@@ -25,7 +25,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'NEXPAY_VERSION', '1.0.0' );
+define( 'NEXPAY_VERSION', '1.1.0' );
 define( 'NEXPAY_PLUGIN_FILE', __FILE__ );
 define( 'NEXPAY_PLUGIN_PATH', plugin_dir_path( __FILE__ ) );
 define( 'NEXPAY_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -112,6 +112,12 @@ function nexpay_init() {
 		return;
 	}
 
+	if ( is_admin() && ! extension_loaded( 'openssl' ) ) {
+		// Nagad's RSA encryption/signing needs OpenSSL. Warn, never fatal.
+		add_action( 'admin_notices', 'nexpay_openssl_missing_notice' );
+	}
+
+	require_once NEXPAY_PLUGIN_PATH . 'includes/class-nexpay-logger.php';
 	require_once NEXPAY_PLUGIN_PATH . 'includes/class-nexpay-gateway.php';
 	require_once NEXPAY_PLUGIN_PATH . 'includes/class-nexpay-gateway-jazzcash.php';
 	require_once NEXPAY_PLUGIN_PATH . 'includes/class-nexpay-gateway-easypaisa.php';
@@ -122,12 +128,91 @@ function nexpay_init() {
 
 	add_filter( 'woocommerce_payment_gateways', 'nexpay_register_gateways' );
 
+	// WooCommerce Blocks (Cart/Checkout) payment method registration.
+	add_action( 'woocommerce_blocks_payment_method_type_registration', 'nexpay_register_blocks_methods' );
+	// Copy Blocks paymentMethodData onto the order before payment runs.
+	add_action( 'woocommerce_store_api_checkout_update_order_from_request', 'nexpay_store_api_save_checkout_data', 10, 2 );
+
 	if ( is_admin() ) {
 		require_once NEXPAY_PLUGIN_PATH . 'includes/class-nexpay-admin.php';
 		NexPay_Admin::init();
 	}
 }
 add_action( 'plugins_loaded', 'nexpay_init' );
+
+/**
+ * Register all six NexPay gateways as WooCommerce Blocks payment methods.
+ *
+ * @param Automattic\WooCommerce\Blocks\Payments\PaymentMethodRegistry $registry Blocks registry.
+ */
+function nexpay_register_blocks_methods( $registry ) {
+	require_once NEXPAY_PLUGIN_PATH . 'includes/class-nexpay-blocks.php';
+
+	foreach ( array_keys( nexpay_gateway_meta() ) as $gateway_id ) {
+		$registry->register( new NexPay_Blocks_Payment_Method( $gateway_id ) );
+	}
+}
+
+/**
+ * Find the live gateway instance for a gateway id.
+ *
+ * @param string $gateway_id Gateway id, e.g. "nexpay_jazzcash".
+ * @return WC_Payment_Gateway|null
+ */
+function nexpay_get_gateway_instance( $gateway_id ) {
+	if ( ! function_exists( 'WC' ) || ! WC() || ! isset( WC()->payment_gateways ) || ! WC()->payment_gateways ) {
+		return null;
+	}
+
+	foreach ( WC()->payment_gateways->payment_gateways() as $gateway ) {
+		if ( isset( $gateway->id ) && $gateway->id === $gateway_id ) {
+			return $gateway;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Store API checkout hook: copy the Blocks paymentMethodData for a NexPay
+ * gateway onto the order (as meta) and into the gateway's request-scoped
+ * store, so validate_fields()/process_payment() see the values exactly as
+ * if they had been posted by the classic checkout form.
+ *
+ * @param WC_Order                                        $order   Order.
+ * @param Automattic\WooCommerce\StoreApi\Utilities\OrderController|WP_REST_Request $request Request.
+ */
+function nexpay_store_api_save_checkout_data( $order, $request ) {
+	$payment_method = method_exists( $request, 'get_param' ) ? $request->get_param( 'payment_method' ) : null;
+	if ( ! is_string( $payment_method ) || 0 !== strpos( $payment_method, 'nexpay_' ) ) {
+		return;
+	}
+
+	$payment_data = $request->get_param( 'payment_data' );
+	$data         = array();
+	if ( is_array( $payment_data ) ) {
+		foreach ( $payment_data as $pair ) {
+			if ( is_array( $pair ) && isset( $pair['key'] ) ) {
+				$data[ $pair['key'] ] = isset( $pair['value'] ) ? $pair['value'] : '';
+			} elseif ( is_array( $pair ) ) {
+				$data = array_merge( $data, $pair );
+			}
+		}
+	}
+	// Some Blocks versions deliver an associative array directly.
+	if ( empty( $data ) && is_array( $payment_data ) ) {
+		$data = $payment_data;
+	}
+	if ( empty( $data ) ) {
+		return;
+	}
+
+	$gateway = nexpay_get_gateway_instance( $payment_method );
+	if ( $gateway && method_exists( $gateway, 'save_blocks_checkout_data' ) ) {
+		$gateway->save_blocks_checkout_data( $order, $data );
+		$order->save();
+	}
+}
 
 /**
  * Register all NexPay gateways with WooCommerce.
@@ -187,5 +272,16 @@ function nexpay_woocommerce_missing_notice() {
 	printf(
 		'<div class="notice notice-error"><p>%s</p></div>',
 		esc_html__( 'NexPay requires WooCommerce to be installed and active. Please install WooCommerce to accept payments with NexPay.', 'nexpay' )
+	);
+}
+
+/**
+ * Admin notice shown when the PHP OpenSSL extension is missing (Nagad
+ * cannot encrypt/sign without it). A warning only — never a fatal error.
+ */
+function nexpay_openssl_missing_notice() {
+	printf(
+		'<div class="notice notice-warning"><p>%s</p></div>',
+		esc_html__( 'NexPay: the PHP OpenSSL extension is not enabled on this server. The Nagad gateway cannot work without it — please ask your host to enable OpenSSL.', 'nexpay' )
 	);
 }
