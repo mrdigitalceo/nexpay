@@ -8,10 +8,11 @@
  *
  *     upi://pay?pa=<merchant VPA>&pn=<payee name>&am=<amount>&cu=INR&tr=<ref>
  *
- * — puts the order on-hold, and shows the link (plus the raw QR payload) on
- * the thank-you page so the customer can pay with any UPI app (BHIM, GPay,
- * PhonePe, Paytm…). The store owner verifies the payment against the UPI
- * reference and marks the order complete.
+ * — puts the order on-hold, and shows the intent link on the thank-you page
+ * so the customer can open it and pay with any UPI app (BHIM, GPay,
+ * PhonePe, Paytm…). There is NO automatic confirmation: the store owner
+ * verifies the payment against the UPI transaction reference and marks
+ * the order complete manually (see docs/SETUP.md).
  *
  * @package NexPay
  */
@@ -42,6 +43,9 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 		$this->supports           = array( 'products' );
 		$this->brand_label        = 'UPI';
 		$this->supported_currencies = array( 'INR' );
+		$this->blocks_fields      = array(
+			'nexpay_upi_vpa' => '_nexpay_upi_customer_vpa',
+		);
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -64,7 +68,7 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 		$this->form_fields = array_merge(
 			$this->standard_form_fields(
 				__( 'UPI', 'nexpay' ),
-				__( 'Pay instantly with any UPI app (BHIM, Google Pay, PhonePe, Paytm).', 'nexpay' )
+				__( 'Pay with any UPI app (BHIM, Google Pay, PhonePe, Paytm) using a UPI intent link. Your order stays on hold until the store verifies your payment — it is not confirmed automatically.', 'nexpay' )
 			),
 			array(
 				'merchant_vpa' => array(
@@ -96,6 +100,18 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 	}
 
 	/**
+	 * Credentials required before this gateway may be enabled.
+	 *
+	 * @return array
+	 */
+	protected function required_settings_fields() {
+		return array(
+			'merchant_vpa' => __( 'Merchant UPI ID (VPA)', 'nexpay' ),
+			'payee_name'   => __( 'Payee Name', 'nexpay' ),
+		);
+	}
+
+	/**
 	 * Checkout field: the customer's UPI ID.
 	 */
 	protected function render_checkout_fields() {
@@ -117,22 +133,45 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 	}
 
 	/**
-	 * Build the UPI intent link / QR payload for an order.
+	 * Build a UPI intent URI from raw parts. The merchant VPA and payee
+	 * name come from the gateway settings; the amount, reference and note
+	 * come from the order — every value is RFC 3986 encoded.
+	 * Static so it can be unit tested.
+	 *
+	 * @param string $merchant_vpa Merchant UPI ID (pa).
+	 * @param string $payee_name   Payee name (pn).
+	 * @param string $amount       Exact amount (am), decimal string.
+	 * @param string $reference    Transaction reference (tr).
+	 * @param string $note         Transaction note (tn).
+	 * @return string upi://pay?... URI.
+	 */
+	public static function build_upi_uri( $merchant_vpa, $payee_name, $amount, $reference, $note ) {
+		$params = array(
+			'pa' => (string) $merchant_vpa,
+			'pn' => (string) $payee_name,
+			'am' => self::format_amount( $amount ),
+			'cu' => 'INR',
+			'tr' => (string) $reference,
+			'tn' => (string) $note,
+		);
+
+		return 'upi://pay?' . http_build_query( $params, '', '&', PHP_QUERY_RFC3986 );
+	}
+
+	/**
+	 * Build the UPI intent link for an order.
 	 *
 	 * @param WC_Order $order Order.
 	 * @return string upi://pay?... URL.
 	 */
 	public function build_upi_link( WC_Order $order ) {
-		$params = array(
-			'pa' => $this->merchant_vpa,                                     // Payee address (merchant VPA).
-			'pn' => '' !== $this->payee_name ? $this->payee_name : get_bloginfo( 'name' ), // Payee name.
-			'am' => number_format( (float) $order->get_total(), 2, '.', '' ), // Amount.
-			'cu' => 'INR',                                                    // Currency.
-			'tr' => 'NX' . $order->get_id(),                                  // Transaction reference.
-			'tn' => sprintf( 'Order #%s', $order->get_order_number() ),       // Transaction note.
+		return self::build_upi_uri(
+			$this->merchant_vpa,
+			'' !== $this->payee_name ? $this->payee_name : get_bloginfo( 'name' ),
+			$order->get_total(),
+			'NX' . $order->get_id(),
+			sprintf( 'Order #%s', $order->get_order_number() )
 		);
-
-		return 'upi://pay?' . http_build_query( $params, '', '&', PHP_QUERY_RFC3986 );
 	}
 
 	/**
@@ -154,7 +193,10 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 		}
 
 		$customer_vpa = $this->posted_field( 'nexpay_upi_vpa' );
-		$upi_link     = $this->build_upi_link( $order );
+		if ( ! self::is_valid_vpa( $customer_vpa ) ) {
+			return $this->payment_failure( __( 'Please enter a valid UPI ID (e.g. yourname@okbank).', 'nexpay' ) );
+		}
+		$upi_link = $this->build_upi_link( $order );
 
 		$order->update_meta_data( '_nexpay_upi_customer_vpa', $customer_vpa );
 		$order->update_meta_data( '_nexpay_upi_link', $upi_link );
@@ -173,7 +215,7 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 	}
 
 	/**
-	 * Show the pay button + QR payload on the thank-you page while the
+	 * Show the pay button + intent link on the thank-you page while the
 	 * order is still awaiting payment.
 	 *
 	 * @param int $order_id Order ID.
@@ -191,7 +233,7 @@ class NexPay_Gateway_UPI extends NexPay_Gateway {
 
 		echo '<section class="nexpay-upi-box">';
 		echo '<h2>' . esc_html__( 'Complete your UPI payment', 'nexpay' ) . '</h2>';
-		echo '<p>' . esc_html__( 'Tap the button below (on mobile) to pay with any UPI app, or scan a QR code of the payload with your UPI app:', 'nexpay' ) . '</p>';
+		echo '<p>' . esc_html__( 'Tap the button below to open your UPI app and pay. Your payment is not confirmed automatically — your order stays on hold until the store verifies the payment against the UPI transaction reference.', 'nexpay' ) . '</p>';
 		printf(
 			'<p><a class="button nexpay-upi-pay-button" href="%s">%s</a></p>',
 			esc_url( $upi_link ),

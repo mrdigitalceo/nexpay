@@ -23,7 +23,7 @@ defined( 'ABSPATH' ) || exit;
 class NexPay_Gateway_Nagad extends NexPay_Gateway {
 
 	const LIVE_BASE    = 'https://api.mynagad.com/api/dfs/';
-	const SANDBOX_BASE = 'http://sandbox.mynagad.com:10080/remote-payment-gateway-1.0/api/dfs/';
+	const SANDBOX_BASE = 'https://sandbox.mynagad.com:10080/remote-payment-gateway-1.0/api/dfs/';
 
 	/**
 	 * Merchant credentials & keys.
@@ -47,6 +47,9 @@ class NexPay_Gateway_Nagad extends NexPay_Gateway {
 		$this->brand_label        = 'Nagad';
 		$this->callback_slug      = 'nexpay_nagad';
 		$this->supported_currencies = array( 'BDT' );
+		$this->blocks_fields      = array(
+			'nexpay_nagad_mobile' => '_nexpay_nagad_mobile',
+		);
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -102,6 +105,20 @@ class NexPay_Gateway_Nagad extends NexPay_Gateway {
 	}
 
 	/**
+	 * Credentials required before this gateway may be enabled.
+	 *
+	 * @return array
+	 */
+	protected function required_settings_fields() {
+		return array(
+			'merchant_id'     => __( 'Merchant ID', 'nexpay' ),
+			'merchant_number' => __( 'Merchant Number', 'nexpay' ),
+			'public_key'      => __( 'Nagad Public Key', 'nexpay' ),
+			'private_key'     => __( 'Merchant Private Key', 'nexpay' ),
+		);
+	}
+
+	/**
 	 * Checkout field: Nagad mobile number.
 	 */
 	protected function render_checkout_fields() {
@@ -114,10 +131,47 @@ class NexPay_Gateway_Nagad extends NexPay_Gateway {
 	 * @return bool
 	 */
 	public function validate_fields() {
-		$mobile = preg_replace( '/\D+/', '', $this->posted_field( 'nexpay_nagad_mobile' ) );
-
-		if ( ! preg_match( '/^01[3-9]\d{8}$/', $mobile ) ) {
+		if ( ! self::is_valid_bd_mobile( $this->posted_field( 'nexpay_nagad_mobile' ) ) ) {
 			wc_add_notice( __( 'Please enter a valid Nagad mobile number (e.g. 01XXXXXXXXX).', 'nexpay' ), 'error' );
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Strictly match a Nagad Payment Verification API response against the
+	 * expected merchant, order reference and amount. ALL of the following
+	 * must hold — any missing field fails closed:
+	 *  - status is a final success status,
+	 *  - merchantId equals the configured merchant,
+	 *  - orderId equals the reference stored on the order,
+	 *  - amount equals the order total (BDT, exact 2-decimal compare).
+	 * Static so it can be unit tested.
+	 *
+	 * @param array  $body           Decoded verification response.
+	 * @param string $merchant_id    Configured merchant ID.
+	 * @param string $expected_ref   Order reference stored on the order.
+	 * @param string $expected_amount Order total (decimal string).
+	 * @return bool
+	 */
+	public static function verification_matches( array $body, $merchant_id, $expected_ref, $expected_amount ) {
+		foreach ( array( 'status', 'merchantId', 'orderId', 'amount' ) as $key ) {
+			if ( ! isset( $body[ $key ] ) || '' === (string) $body[ $key ] ) {
+				return false;
+			}
+		}
+
+		if ( 'Success' !== (string) $body['status'] ) {
+			return false;
+		}
+		if ( (string) $body['merchantId'] !== (string) $merchant_id ) {
+			return false;
+		}
+		if ( (string) $body['orderId'] !== (string) $expected_ref ) {
+			return false;
+		}
+		if ( self::format_amount( $body['amount'] ) !== self::format_amount( $expected_amount ) ) {
 			return false;
 		}
 
@@ -211,7 +265,7 @@ class NexPay_Gateway_Nagad extends NexPay_Gateway {
 		$response = wp_remote_post(
 			$url,
 			array(
-				'timeout' => 45,
+				'timeout' => 30,
 				'headers' => array(
 					'Content-Type' => 'application/json',
 					'Accept'       => 'application/json',
@@ -366,15 +420,27 @@ class NexPay_Gateway_Nagad extends NexPay_Gateway {
 			exit;
 		}
 
-		// Server-to-server verification is the real source of truth.
+		// Server-to-server verification is the real source of truth — and
+		// the response must match this merchant, this order's reference
+		// and the exact order amount, not merely report "Success".
 		$response = wp_remote_get( $this->base_url() . 'verify/payment/' . $payment_ref, array( 'timeout' => 30 ) );
 		$verified = false;
 		$issuer_ref = '';
 
 		if ( ! is_wp_error( $response ) ) {
-			$body       = json_decode( wp_remote_retrieve_body( $response ), true );
-			$verified   = is_array( $body ) && isset( $body['status'] ) && 'Success' === $body['status'];
-			$issuer_ref = isset( $body['issuerPaymentRefNo'] ) ? $body['issuerPaymentRefNo'] : '';
+			$body = json_decode( wp_remote_retrieve_body( $response ), true );
+			if ( is_array( $body ) ) {
+				$verified = self::verification_matches(
+					$body,
+					$this->merchant_id,
+					(string) $order->get_meta( '_nexpay_nagad_order_ref' ),
+					(string) $order->get_total()
+				);
+				if ( $verified && isset( $body['paymentRefId'] ) && (string) $body['paymentRefId'] !== $payment_ref ) {
+					$verified = false;
+				}
+				$issuer_ref = isset( $body['issuerPaymentRefNo'] ) ? $body['issuerPaymentRefNo'] : '';
+			}
 		}
 
 		if ( $verified ) {

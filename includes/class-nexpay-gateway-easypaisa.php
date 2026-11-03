@@ -5,8 +5,15 @@
  * Uses the Easypaisa hosted payment page ("Easypay"): the customer is sent
  * to Easypaisa with a signed payload (storeId, orderRefNum, amount,
  * postBackURL, merchantHashedReq) and Easypaisa posts the result back to
- * this gateway's callback endpoint (wc-api=nexpay_easypaisa), where the
- * returned hash is verified before the order is updated.
+ * this gateway's callback endpoint (wc-api=nexpay_easypaisa).
+ *
+ * Security model (v1.1.0): merchantHashedReq is a KEYED SHA-256 hash —
+ * the ordered request parameters combined with the merchant Hash Key
+ * (see build_merchant_hash()). The postback handler recomputes the hash
+ * from the stored order, compares it in constant time, and additionally
+ * validates the store id, the order reference, the exact amount and the
+ * currency before an order may be marked paid. If no Hash Key is
+ * configured, postbacks fail closed (no order is ever paid).
  *
  * The same endpoint also renders the auto-submitting payment form when it
  * is visited with ?nexpay_action=pay&order_id=…&key=… right after checkout.
@@ -31,6 +38,7 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 	 */
 	protected $store_id = '';
 	protected $account_number = '';
+	protected $hash_key = '';
 
 	/**
 	 * Constructor.
@@ -44,6 +52,9 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 		$this->brand_label        = 'easypaisa';
 		$this->callback_slug      = 'nexpay_easypaisa';
 		$this->supported_currencies = array( 'PKR' );
+		$this->blocks_fields      = array(
+			'nexpay_easypaisa_mobile' => '_nexpay_easypaisa_mobile',
+		);
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -53,6 +64,7 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 		$this->description    = $this->get_option( 'description' );
 		$this->store_id       = $this->get_option( 'store_id' );
 		$this->account_number = $this->get_option( 'account_number' );
+		$this->hash_key       = $this->get_option( 'hash_key' );
 
 		add_action( 'woocommerce_update_options_payment_gateways_' . $this->id, array( $this, 'process_admin_options' ) );
 		add_action( 'woocommerce_api_nexpay_easypaisa', array( $this, 'handle_request' ) );
@@ -80,7 +92,26 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 					'description' => __( 'Your Easypaisa merchant account number (where payments settle).', 'nexpay' ),
 					'desc_tip'    => true,
 				),
+				'hash_key'       => array(
+					'title'       => __( 'Merchant Hash Key', 'nexpay' ),
+					'type'        => 'password',
+					'description' => __( 'The Easypaisa merchant Hash Key used to sign requests and verify postbacks (keyed SHA-256). Required — without it, postbacks are rejected and no order can be marked paid.', 'nexpay' ),
+					'desc_tip'    => true,
+				),
 			)
+		);
+	}
+
+	/**
+	 * Credentials required before this gateway may be enabled.
+	 *
+	 * @return array
+	 */
+	protected function required_settings_fields() {
+		return array(
+			'store_id'       => __( 'Store ID', 'nexpay' ),
+			'account_number' => __( 'Account Number', 'nexpay' ),
+			'hash_key'       => __( 'Merchant Hash Key', 'nexpay' ),
 		);
 	}
 
@@ -97,10 +128,8 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 	 * @return bool
 	 */
 	public function validate_fields() {
-		$mobile = preg_replace( '/\D+/', '', $this->posted_field( 'nexpay_easypaisa_mobile' ) );
-
-		if ( strlen( $mobile ) < 10 || strlen( $mobile ) > 13 ) {
-			wc_add_notice( __( 'Please enter a valid Easypaisa mobile number.', 'nexpay' ), 'error' );
+		if ( ! self::is_valid_pk_mobile( $this->posted_field( 'nexpay_easypaisa_mobile' ) ) ) {
+			wc_add_notice( __( 'Please enter a valid Easypaisa mobile number (e.g. 03XX XXXXXXX).', 'nexpay' ), 'error' );
 			return false;
 		}
 
@@ -108,27 +137,114 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 	}
 
 	/**
-	 * Build the Easypay "merchantHashedReq" value.
-	 *
-	 * The hashed request is a SHA-256 digest over the core transaction
-	 * fields. Stores issued with an Easypaisa hash key should append it to
-	 * the field list through the `nexpay_easypaisa_hash_fields` filter.
+	 * The ordered field values that go into the Easypay hash, per the
+	 * Easypaisa hosted-page protocol: storeId, orderRefNum, amount,
+	 * postBackURL, accountNum.
 	 *
 	 * @param array $fields Core transaction fields.
-	 * @return string
+	 * @return string[]
 	 */
-	protected function merchant_hashed_req( array $fields ) {
+	public static function hash_field_values( array $fields ) {
 		$parts = array(
-			$fields['storeId'],
-			$fields['orderRefNum'],
-			$fields['amount'],
-			$fields['postBackURL'],
-			$fields['accountNum'],
+			isset( $fields['storeId'] ) ? (string) $fields['storeId'] : '',
+			isset( $fields['orderRefNum'] ) ? (string) $fields['orderRefNum'] : '',
+			isset( $fields['amount'] ) ? (string) $fields['amount'] : '',
+			isset( $fields['postBackURL'] ) ? (string) $fields['postBackURL'] : '',
+			isset( $fields['accountNum'] ) ? (string) $fields['accountNum'] : '',
 		);
 
-		$parts = apply_filters( 'nexpay_easypaisa_hash_fields', $parts, $fields );
+		return apply_filters( 'nexpay_easypaisa_hash_fields', $parts, $fields );
+	}
+
+	/**
+	 * Build the keyed Easypay "merchantHashedReq" value: SHA-256 over the
+	 * ordered request parameters combined with the merchant Hash Key.
+	 *
+	 * @param array  $fields   Core transaction fields.
+	 * @param string $hash_key Merchant Hash Key (secret).
+	 * @return string Uppercase hex digest, or empty string without a key.
+	 */
+	public static function build_merchant_hash( array $fields, $hash_key ) {
+		if ( '' === (string) $hash_key ) {
+			return '';
+		}
+
+		$parts   = self::hash_field_values( $fields );
+		$parts[] = (string) $hash_key;
 
 		return strtoupper( hash( 'sha256', implode( '&', $parts ) ) );
+	}
+
+	/**
+	 * Verify an Easypaisa postback against the expected (server-side)
+	 * transaction data. Pure/static so it can be unit tested.
+	 *
+	 * @param array  $posted   Postback fields (storeId, orderRefNum, amount,
+	 *                         optional currency, merchantHashedReq).
+	 * @param array  $expected Expected fields built from the stored order
+	 *                         and the gateway settings.
+	 * @param string $hash_key Merchant Hash Key.
+	 * @return true|string True when valid, otherwise an error code:
+	 *                     missing_hash_key, missing_fields, store_mismatch,
+	 *                     order_mismatch, amount_mismatch, currency_mismatch,
+	 *                     hash_mismatch.
+	 */
+	public static function verify_postback_data( array $posted, array $expected, $hash_key ) {
+		if ( '' === (string) $hash_key ) {
+			return 'missing_hash_key';
+		}
+
+		foreach ( array( 'orderRefNum', 'merchantHashedReq' ) as $required ) {
+			if ( ! isset( $posted[ $required ] ) || '' === (string) $posted[ $required ] ) {
+				return 'missing_fields';
+			}
+		}
+
+		if ( ! isset( $posted['storeId'] ) || (string) $posted['storeId'] !== (string) $expected['storeId'] ) {
+			return 'store_mismatch';
+		}
+
+		if ( (string) $posted['orderRefNum'] !== (string) $expected['orderRefNum'] ) {
+			return 'order_mismatch';
+		}
+
+		$posted_amount = '';
+		if ( isset( $posted['amount'] ) && '' !== (string) $posted['amount'] ) {
+			$posted_amount = (string) $posted['amount'];
+		} elseif ( isset( $posted['transactionAmount'] ) ) {
+			$posted_amount = (string) $posted['transactionAmount'];
+		}
+		if ( '' === $posted_amount || self::format_amount( $posted_amount ) !== self::format_amount( $expected['amount'] ) ) {
+			return 'amount_mismatch';
+		}
+
+		if ( isset( $posted['currency'] ) && '' !== (string) $posted['currency'] && 'PKR' !== strtoupper( (string) $posted['currency'] ) ) {
+			return 'currency_mismatch';
+		}
+
+		$expected_hash = self::build_merchant_hash( $expected, $hash_key );
+		if ( ! hash_equals( $expected_hash, strtoupper( (string) $posted['merchantHashedReq'] ) ) ) {
+			return 'hash_mismatch';
+		}
+
+		return true;
+	}
+
+	/**
+	 * Build the expected transaction fields for an order from the gateway
+	 * settings + the stored order (server-side source of truth).
+	 *
+	 * @param WC_Order $order Order.
+	 * @return array
+	 */
+	protected function expected_fields( WC_Order $order ) {
+		return array(
+			'storeId'     => $this->store_id,
+			'accountNum'  => $this->account_number,
+			'amount'      => self::format_amount( $order->get_total() ),
+			'orderRefNum' => (string) $order->get_id(),
+			'postBackURL' => $this->get_callback_url(),
+		);
 	}
 
 	/**
@@ -140,19 +256,17 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 	protected function build_payload( WC_Order $order ) {
 		$expiry = gmdate( 'Ymd His', current_time( 'timestamp' ) + DAY_IN_SECONDS );
 
-		$payload = array(
-			'storeId'          => $this->store_id,
-			'accountNum'       => $this->account_number,
-			'amount'           => number_format( (float) $order->get_total(), 2, '.', '' ),
-			'orderRefNum'      => (string) $order->get_id(),
-			'postBackURL'      => $this->get_callback_url(),
-			'expiryDate'       => $expiry,
-			'autoRedirect'     => '1',
-			'paymentMethod'    => 'MA_PAYMENT_METHOD',
-			'emailAddress'     => $order->get_billing_email(),
-			'mobileNum'        => $order->get_meta( '_nexpay_easypaisa_mobile' ),
+		$payload = array_merge(
+			$this->expected_fields( $order ),
+			array(
+				'expiryDate'    => $expiry,
+				'autoRedirect'  => '1',
+				'paymentMethod' => 'MA_PAYMENT_METHOD',
+				'emailAddress'  => $order->get_billing_email(),
+				'mobileNum'     => $order->get_meta( '_nexpay_easypaisa_mobile' ),
+			)
 		);
-		$payload['merchantHashedReq'] = $this->merchant_hashed_req( $payload );
+		$payload['merchantHashedReq'] = self::build_merchant_hash( $payload, $this->hash_key );
 
 		return $payload;
 	}
@@ -171,8 +285,8 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 			return $this->payment_failure( __( 'Order not found.', 'nexpay' ) );
 		}
 
-		if ( '' === $this->store_id || '' === $this->account_number ) {
-			$this->log( 'Payment aborted: Easypaisa credentials are not configured.', 'error' );
+		if ( '' === $this->store_id || '' === $this->account_number || '' === $this->hash_key ) {
+			$this->log( 'Payment aborted: Easypaisa credentials (incl. Hash Key) are not configured.', 'error' );
 			return $this->payment_failure( __( 'Easypaisa is not configured correctly. Please contact the store owner.', 'nexpay' ) );
 		}
 
@@ -252,38 +366,67 @@ class NexPay_Gateway_Easypaisa extends NexPay_Gateway {
 	}
 
 	/**
-	 * Handle the Easypaisa postback: verify the returned hash matches the
-	 * order on file before marking it paid.
+	 * Handle the Easypaisa postback. The order is only marked paid after
+	 * the keyed hash, store id, order reference, exact amount and currency
+	 * all verify against the stored order. Processing is idempotent: a
+	 * repeated postback with the same provider transaction reference is
+	 * acknowledged without completing the order twice.
 	 */
 	protected function handle_postback() {
-		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified via merchantHashedReq below.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified via the keyed merchantHashedReq below.
 		$raw = wp_unslash( $_POST );
 
-		$order_ref = isset( $raw['orderRefNum'] ) ? sanitize_text_field( $raw['orderRefNum'] ) : '';
-		$status    = isset( $raw['status'] ) ? sanitize_text_field( $raw['status'] ) : '';
-		$hash      = isset( $raw['merchantHashedReq'] ) ? strtoupper( sanitize_text_field( $raw['merchantHashedReq'] ) ) : '';
+		$posted = array();
+		foreach ( array( 'storeId', 'orderRefNum', 'amount', 'transactionAmount', 'currency', 'status', 'transactionId', 'merchantHashedReq' ) as $key ) {
+			if ( isset( $raw[ $key ] ) ) {
+				$posted[ $key ] = sanitize_text_field( $raw[ $key ] );
+			}
+		}
 
-		$order = $order_ref ? wc_get_order( absint( $order_ref ) ) : null;
+		$order_ref = isset( $posted['orderRefNum'] ) ? $posted['orderRefNum'] : '';
+		$order     = $order_ref ? wc_get_order( absint( $order_ref ) ) : null;
 		if ( ! $order ) {
 			$this->log( 'Postback for unknown order ref: ' . $order_ref, 'warning' );
 			status_header( 404 );
 			exit;
 		}
 
-		// Rebuild the expected hash from the stored order and compare it with
-		// what Easypaisa sent back — a mismatch means a forged postback.
-		$expected = $this->merchant_hashed_req( $this->build_payload( $order ) );
-		if ( '' === $hash || ! $this->hash_matches( $expected, $hash ) ) {
-			$this->log( 'Postback hash verification FAILED for order #' . $order->get_id(), 'error' );
+		$check = self::verify_postback_data( $posted, $this->expected_fields( $order ), $this->hash_key );
+		if ( true !== $check ) {
+			$this->log(
+				sprintf( 'Postback verification FAILED for order #%s (%s).', $order->get_id(), $check ),
+				'error'
+			);
 			status_header( 400 );
 			exit;
 		}
 
+		$status = isset( $posted['status'] ) ? $posted['status'] : '';
+		$txn_id = isset( $posted['transactionId'] ) && '' !== $posted['transactionId'] ? $posted['transactionId'] : $order_ref;
+
+		// Idempotency: this provider transaction was already processed.
+		$processed_txn = (string) $order->get_meta( '_nexpay_easypaisa_txn_id' );
+		if ( '' !== $processed_txn && $processed_txn === $txn_id && $order->is_paid() ) {
+			wp_safe_redirect( $this->get_return_url( $order ) );
+			exit;
+		}
+
+		// A transaction reference may never be reused across orders.
+		if ( '' !== $txn_id ) {
+			$other = $this->get_order_by_meta( '_nexpay_easypaisa_txn_id', $txn_id );
+			if ( $other && $other->get_id() !== $order->get_id() ) {
+				$this->log( 'Postback transaction reference already used by another order; rejected for order #' . $order->get_id(), 'error' );
+				status_header( 400 );
+				exit;
+			}
+		}
+
 		if ( ! $order->is_paid() ) {
 			if ( in_array( $status, array( '0000', 'SUCCESS', 'success' ), true ) ) {
-				$txn_id = isset( $raw['transactionId'] ) ? sanitize_text_field( $raw['transactionId'] ) : $order_ref;
+				$order->update_meta_data( '_nexpay_easypaisa_txn_id', $txn_id );
+				$order->save();
 				$order->payment_complete( $txn_id );
-				$order->add_order_note( __( 'Easypaisa postback verified: payment confirmed.', 'nexpay' ) );
+				$order->add_order_note( __( 'Easypaisa postback verified (keyed hash, amount, store): payment confirmed.', 'nexpay' ) );
 				$this->log( 'Postback confirmed payment for order #' . $order->get_id() );
 			} else {
 				$order->update_status( 'failed', __( 'Easypaisa reported a failed payment.', 'nexpay' ) );

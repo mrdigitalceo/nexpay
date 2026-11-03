@@ -8,9 +8,12 @@
  *  2. POST {base}/mpesa/stkpush/v1/processrequest  (STK Push / "Lipa na
  *     M-Pesa Online") — the customer approves by entering their M-Pesa PIN
  *     on their phone. Password = base64(Shortcode + Passkey + Timestamp).
- *  3. Daraja posts the result to the callback URL (wc-api=nexpay_mpesa);
- *     ResultCode 0 means success and the order is completed with the
- *     M-Pesa receipt number.
+ *  3. Daraja posts the result to the callback URL (wc-api=nexpay_mpesa).
+ *     The callback payload alone is NOT trusted: on a success callback the
+ *     plugin confirms the final result server-to-server with the Daraja
+ *     STK Push Query API, validates the amount against the order, and only
+ *     then completes the order with the M-Pesa receipt number (which may
+ *     never be reused on a second order).
  *
  * @package NexPay
  */
@@ -47,6 +50,9 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 		$this->brand_label        = 'M-PESA';
 		$this->callback_slug      = 'nexpay_mpesa';
 		$this->supported_currencies = array( 'KES' );
+		$this->blocks_fields      = array(
+			'nexpay_mpesa_phone' => '_nexpay_mpesa_phone',
+		);
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -75,7 +81,7 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 			array(
 				'consumer_key'    => array(
 					'title' => __( 'Consumer Key', 'nexpay' ),
-					'type'  => 'text',
+					'type'  => 'password',
 				),
 				'consumer_secret' => array(
 					'title' => __( 'Consumer Secret', 'nexpay' ),
@@ -92,6 +98,20 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 					'type'  => 'password',
 				),
 			)
+		);
+	}
+
+	/**
+	 * Credentials required before this gateway may be enabled.
+	 *
+	 * @return array
+	 */
+	protected function required_settings_fields() {
+		return array(
+			'consumer_key'    => __( 'Consumer Key', 'nexpay' ),
+			'consumer_secret' => __( 'Consumer Secret', 'nexpay' ),
+			'shortcode'       => __( 'Business Shortcode', 'nexpay' ),
+			'passkey'         => __( 'Passkey', 'nexpay' ),
 		);
 	}
 
@@ -232,7 +252,7 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 		$response = wp_remote_post(
 			$this->base_url() . '/mpesa/stkpush/v1/processrequest',
 			array(
-				'timeout' => 45,
+				'timeout' => 30,
 				'headers' => array(
 					'Content-Type'  => 'application/json',
 					'Authorization' => 'Bearer ' . $token,
@@ -272,10 +292,97 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 	}
 
 	/**
+	 * Confirm an STK Push result server-to-server with the Daraja STK Push
+	 * Query API.
+	 *
+	 * @param string $checkout_request_id CheckoutRequestID from the push.
+	 * @return array|WP_Error Decoded query response.
+	 */
+	protected function query_stk_status( $checkout_request_id ) {
+		$token = $this->get_access_token();
+		if ( is_wp_error( $token ) ) {
+			return $token;
+		}
+
+		$timestamp = current_time( 'YmdHis' );
+		$password  = base64_encode( $this->shortcode . $this->passkey . $timestamp ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- Daraja password algorithm.
+
+		$response = wp_remote_post(
+			$this->base_url() . '/mpesa/stkpushquery/v1/query',
+			array(
+				'timeout' => 30,
+				'headers' => array(
+					'Content-Type'  => 'application/json',
+					'Authorization' => 'Bearer ' . $token,
+				),
+				'body'    => wp_json_encode(
+					array(
+						'BusinessShortCode' => $this->shortcode,
+						'Password'          => $password,
+						'Timestamp'         => $timestamp,
+						'CheckoutRequestID' => $checkout_request_id,
+					)
+				),
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		return is_array( $body ) ? $body : new WP_Error( 'nexpay_mpesa_query', __( 'Malformed STK query response.', 'nexpay' ) );
+	}
+
+	/**
+	 * Extract one item from Daraja CallbackMetadata.
+	 *
+	 * @param array  $callback stkCallback payload.
+	 * @param string $name     Metadata item name.
+	 * @return string Value or empty string.
+	 */
+	protected function callback_meta_value( array $callback, $name ) {
+		if ( ! empty( $callback['CallbackMetadata']['Item'] ) && is_array( $callback['CallbackMetadata']['Item'] ) ) {
+			foreach ( $callback['CallbackMetadata']['Item'] as $item ) {
+				if ( isset( $item['Name'] ) && $name === $item['Name'] && isset( $item['Value'] ) ) {
+					return (string) $item['Value'];
+				}
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Human-readable note for a failed/cancelled STK Push result code.
+	 *
+	 * @param int    $result_code Daraja ResultCode.
+	 * @param string $desc        Daraja ResultDesc.
+	 * @return string
+	 */
+	protected function failure_note( $result_code, $desc ) {
+		$known = array(
+			1    => __( 'M-Pesa payment failed: insufficient balance.', 'nexpay' ),
+			1032 => __( 'M-Pesa payment cancelled by the customer.', 'nexpay' ),
+			1037 => __( 'M-Pesa payment timed out: the phone could not be reached or the PIN was not entered in time.', 'nexpay' ),
+			2001 => __( 'M-Pesa payment failed: invalid PIN or initiator details.', 'nexpay' ),
+		);
+		if ( isset( $known[ $result_code ] ) ) {
+			return $known[ $result_code ];
+		}
+		return sprintf( __( 'M-Pesa payment failed (%1$d): %2$s', 'nexpay' ), $result_code, $desc );
+	}
+
+	/**
 	 * STK Push callback handler (wc-api=nexpay_mpesa).
 	 *
 	 * Daraja posts JSON: Body.stkCallback { MerchantRequestID,
 	 * CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata }.
+	 *
+	 * Trust model: the payload locates the order (via the CheckoutRequestID
+	 * saved at push time) but never pays it by itself. A success callback is
+	 * confirmed with the Daraja STK Push Query API; the amount must match
+	 * the order total and the M-Pesa receipt must not already belong to a
+	 * different order.
 	 */
 	public function handle_callback() {
 		$raw  = file_get_contents( 'php://input' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- reading the Daraja JSON callback body.
@@ -283,7 +390,7 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 
 		$callback = isset( $data['Body']['stkCallback'] ) ? $data['Body']['stkCallback'] : null;
 		if ( ! is_array( $callback ) || empty( $callback['CheckoutRequestID'] ) ) {
-			$this->log( 'Callback received with unexpected payload: ' . $raw, 'warning' );
+			$this->log( 'Callback received with unexpected payload.', 'warning' );
 			status_header( 400 );
 			exit;
 		}
@@ -300,31 +407,61 @@ class NexPay_Gateway_Mpesa extends NexPay_Gateway {
 		header( 'Content-Type: application/json' );
 		echo wp_json_encode( array( 'ResultCode' => 0, 'ResultDesc' => 'Accepted' ) );
 
+		// Idempotent: duplicate callbacks for a paid order change nothing,
+		// and a late failure callback never reverses a paid order.
 		if ( $order->is_paid() ) {
 			exit;
 		}
 
 		$result_code = isset( $callback['ResultCode'] ) ? (int) $callback['ResultCode'] : -1;
+		$desc        = isset( $callback['ResultDesc'] ) ? (string) $callback['ResultDesc'] : 'Unknown error';
 
-		if ( 0 === $result_code ) {
-			$receipt = '';
-			if ( ! empty( $callback['CallbackMetadata']['Item'] ) && is_array( $callback['CallbackMetadata']['Item'] ) ) {
-				foreach ( $callback['CallbackMetadata']['Item'] as $item ) {
-					if ( isset( $item['Name'] ) && 'MpesaReceiptNumber' === $item['Name'] && isset( $item['Value'] ) ) {
-						$receipt = (string) $item['Value'];
-						break;
-					}
-				}
+		if ( 0 !== $result_code ) {
+			if ( ! $order->has_status( array( 'failed', 'cancelled' ) ) ) {
+				$order->update_status( 'failed', $this->failure_note( $result_code, $desc ) );
+				$order->add_order_note( $this->failure_note( $result_code, $desc ) );
 			}
-
-			$order->payment_complete( '' !== $receipt ? $receipt : $callback['CheckoutRequestID'] );
-			$order->add_order_note( sprintf( 'M-Pesa payment confirmed (receipt: %s).', '' !== $receipt ? $receipt : 'n/a' ) );
-			$this->log( 'Callback confirmed payment for order #' . $order->get_id() );
-		} else {
-			$desc = isset( $callback['ResultDesc'] ) ? $callback['ResultDesc'] : 'Unknown error';
-			$order->update_status( 'failed', sprintf( 'M-Pesa payment failed: %s', $desc ) );
 			$this->log( 'Callback marked order #' . $order->get_id() . ' as failed: ' . $desc, 'warning' );
+			exit;
 		}
+
+		// Success claimed — confirm it server-to-server before paying.
+		$query = $this->query_stk_status( $callback['CheckoutRequestID'] );
+		if ( is_wp_error( $query ) || ! isset( $query['ResultCode'] ) || '0' !== (string) $query['ResultCode'] ) {
+			$this->log(
+				'STK query did not confirm success for order #' . $order->get_id() . '; order left unpaid.',
+				'error'
+			);
+			$order->add_order_note( __( 'M-Pesa success callback received but the Daraja STK query did not confirm it yet. The order has NOT been marked paid.', 'nexpay' ) );
+			exit;
+		}
+
+		// Amount must match the order total (KES has no minor unit here).
+		$amount = $this->callback_meta_value( $callback, 'Amount' );
+		if ( '' === $amount || (int) round( (float) $amount ) !== (int) round( (float) $order->get_total() ) ) {
+			$this->log( 'Callback amount mismatch for order #' . $order->get_id() . '; rejected.', 'error' );
+			$order->add_order_note( __( 'M-Pesa callback amount did not match the order total. The order has NOT been marked paid.', 'nexpay' ) );
+			exit;
+		}
+
+		$receipt = $this->callback_meta_value( $callback, 'MpesaReceiptNumber' );
+		if ( '' === $receipt ) {
+			$this->log( 'Callback without MpesaReceiptNumber for order #' . $order->get_id() . '; rejected.', 'error' );
+			exit;
+		}
+
+		// A receipt may only ever pay one order.
+		$other = $this->get_order_by_meta( '_nexpay_mpesa_receipt', $receipt );
+		if ( $other && $other->get_id() !== $order->get_id() ) {
+			$this->log( 'M-Pesa receipt ' . $receipt . ' already used by order #' . $other->get_id() . '; rejected for order #' . $order->get_id(), 'error' );
+			exit;
+		}
+
+		$order->update_meta_data( '_nexpay_mpesa_receipt', $receipt );
+		$order->save();
+		$order->payment_complete( $receipt );
+		$order->add_order_note( sprintf( 'M-Pesa payment confirmed via Daraja STK query (receipt: %s).', $receipt ) );
+		$this->log( 'Callback confirmed payment for order #' . $order->get_id() );
 
 		exit;
 	}

@@ -43,6 +43,10 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 		$this->brand_label        = 'JazzCash';
 		$this->callback_slug      = 'nexpay_jazzcash';
 		$this->supported_currencies = array( 'PKR' );
+		$this->blocks_fields      = array(
+			'nexpay_jazzcash_mobile' => '_nexpay_jazzcash_mobile',
+			'nexpay_jazzcash_cnic'   => '_nexpay_jazzcash_cnic_last6',
+		);
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -91,6 +95,19 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 	}
 
 	/**
+	 * Credentials required before this gateway may be enabled.
+	 *
+	 * @return array
+	 */
+	protected function required_settings_fields() {
+		return array(
+			'merchant_id'    => __( 'Merchant ID', 'nexpay' ),
+			'password'       => __( 'Password', 'nexpay' ),
+			'integrity_salt' => __( 'Integrity Salt', 'nexpay' ),
+		);
+	}
+
+	/**
 	 * Checkout fields: mobile number + CNIC (last 6 digits), as in the design.
 	 */
 	protected function render_checkout_fields() {
@@ -104,16 +121,13 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 	 * @return bool
 	 */
 	public function validate_fields() {
-		$mobile = preg_replace( '/\D+/', '', $this->posted_field( 'nexpay_jazzcash_mobile' ) );
-		$cnic   = preg_replace( '/\D+/', '', $this->posted_field( 'nexpay_jazzcash_cnic' ) );
-
-		if ( strlen( $mobile ) < 10 || strlen( $mobile ) > 13 ) {
-			wc_add_notice( __( 'Please enter a valid JazzCash mobile number.', 'nexpay' ), 'error' );
+		if ( ! self::is_valid_pk_mobile( $this->posted_field( 'nexpay_jazzcash_mobile' ) ) ) {
+			wc_add_notice( __( 'Please enter a valid JazzCash mobile number (e.g. 03XX XXXXXXX).', 'nexpay' ), 'error' );
 			return false;
 		}
 
-		if ( 6 !== strlen( $cnic ) ) {
-			wc_add_notice( __( 'Please enter the last 6 digits of your CNIC.', 'nexpay' ), 'error' );
+		if ( ! self::is_valid_cnic_last6( $this->posted_field( 'nexpay_jazzcash_cnic' ) ) ) {
+			wc_add_notice( __( 'Please enter exactly the last 6 digits of your CNIC.', 'nexpay' ), 'error' );
 			return false;
 		}
 
@@ -126,14 +140,16 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 	 * Algorithm (per the JazzCash integration guide): sort the fields by key,
 	 * then hash "IntegritySalt&value1&value2&..." with HMAC-SHA256, keyed with
 	 * the Integrity Salt. Empty values and pp_SecureHash itself are excluded.
+	 * Static so the algorithm can be unit tested with known vectors.
 	 *
-	 * @param array $fields Field map (without pp_SecureHash).
+	 * @param array  $fields Field map (without pp_SecureHash).
+	 * @param string $salt   Merchant Integrity Salt.
 	 * @return string Uppercase hex digest.
 	 */
-	protected function secure_hash( array $fields ) {
+	public static function build_secure_hash( array $fields, $salt ) {
 		ksort( $fields );
 
-		$hash_string = $this->integrity_salt;
+		$hash_string = (string) $salt;
 		foreach ( $fields as $key => $value ) {
 			if ( 'pp_SecureHash' === $key || '' === (string) $value || null === $value ) {
 				continue;
@@ -141,7 +157,17 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 			$hash_string .= '&' . $value;
 		}
 
-		return strtoupper( $this->hmac_sha256( $hash_string, $this->integrity_salt ) );
+		return strtoupper( hash_hmac( 'sha256', $hash_string, (string) $salt ) );
+	}
+
+	/**
+	 * Instance wrapper around build_secure_hash() using the configured salt.
+	 *
+	 * @param array $fields Field map (without pp_SecureHash).
+	 * @return string Uppercase hex digest.
+	 */
+	protected function secure_hash( array $fields ) {
+		return self::build_secure_hash( $fields, $this->integrity_salt );
 	}
 
 	/**
@@ -172,7 +198,7 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 		$txn_ref   = sprintf( 'T%s%d', current_time( 'YmdHis' ), $order_id );
 		$txn_date  = current_time( 'YmdHis' );
 		$expiry    = gmdate( 'YmdHis', current_time( 'timestamp' ) + DAY_IN_SECONDS );
-		$amount    = (int) round( $order->get_total() * 100 ); // JazzCash expects paisa.
+		$amount    = self::amount_in_minor_units( $order->get_total() ); // JazzCash expects paisa.
 
 		$request = array(
 			'pp_Language'         => 'EN',
@@ -203,7 +229,7 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 		$response = wp_remote_post(
 			$endpoint,
 			array(
-				'timeout' => 45,
+				'timeout' => 30,
 				'headers' => array( 'Content-Type' => 'application/json' ),
 				'body'    => wp_json_encode( $request ),
 			)
@@ -283,14 +309,39 @@ class NexPay_Gateway_JazzCash extends NexPay_Gateway {
 			exit;
 		}
 
+		// Bind the notification to the order: exact amount (in paisa) and
+		// currency must match what we sent. A validly signed notification
+		// for a different amount/currency must never pay this order.
+		$expected_amount = self::amount_in_minor_units( $order->get_total() );
+		if ( ! isset( $params['pp_Amount'] ) || (int) $params['pp_Amount'] !== $expected_amount ) {
+			$this->log( 'IPN amount mismatch for order #' . $order->get_id() . '; rejected.', 'error' );
+			status_header( 400 );
+			exit;
+		}
+		if ( ! isset( $params['pp_TxnCurrency'] ) || 'PKR' !== $params['pp_TxnCurrency'] ) {
+			$this->log( 'IPN currency mismatch for order #' . $order->get_id() . '; rejected.', 'error' );
+			status_header( 400 );
+			exit;
+		}
+
 		if ( $order->is_paid() ) {
 			status_header( 200 );
 			exit; // Already processed — acknowledge and stop.
 		}
 
+		// Duplicate IPN for the same transaction reference: ignore.
+		if ( (string) $order->get_meta( '_nexpay_jazzcash_ipn_txn_ref' ) === $params['pp_TxnRefNo'] ) {
+			status_header( 200 );
+			exit;
+		}
+
 		if ( isset( $params['pp_ResponseCode'] ) && '000' === (string) $params['pp_ResponseCode'] ) {
-			$order->payment_complete( isset( $params['pp_RetreivalReferenceNo'] ) ? $params['pp_RetreivalReferenceNo'] : $params['pp_TxnRefNo'] );
-			$order->add_order_note( __( 'JazzCash IPN verified: payment confirmed.', 'nexpay' ) );
+			$rrn = isset( $params['pp_RetreivalReferenceNo'] ) ? $params['pp_RetreivalReferenceNo'] : $params['pp_TxnRefNo'];
+			$order->update_meta_data( '_nexpay_jazzcash_ipn_txn_ref', $params['pp_TxnRefNo'] );
+			$order->update_meta_data( '_nexpay_jazzcash_rrn', $rrn );
+			$order->save();
+			$order->payment_complete( $rrn );
+			$order->add_order_note( __( 'JazzCash IPN verified (hash, amount, currency): payment confirmed.', 'nexpay' ) );
 			$this->log( 'IPN confirmed payment for order #' . $order->get_id() );
 		} else {
 			$order->update_status( 'failed', __( 'JazzCash IPN reported a failed transaction.', 'nexpay' ) );

@@ -44,6 +44,9 @@ class NexPay_Gateway_BKash extends NexPay_Gateway {
 		$this->brand_label        = 'bKash';
 		$this->callback_slug      = 'nexpay_bkash';
 		$this->supported_currencies = array( 'BDT' );
+		$this->blocks_fields      = array(
+			'nexpay_bkash_mobile' => '_nexpay_bkash_mobile',
+		);
 
 		$this->init_form_fields();
 		$this->init_settings();
@@ -91,6 +94,20 @@ class NexPay_Gateway_BKash extends NexPay_Gateway {
 	}
 
 	/**
+	 * Credentials required before this gateway may be enabled.
+	 *
+	 * @return array
+	 */
+	protected function required_settings_fields() {
+		return array(
+			'app_key'    => __( 'App Key', 'nexpay' ),
+			'app_secret' => __( 'App Secret', 'nexpay' ),
+			'username'   => __( 'Username', 'nexpay' ),
+			'password'   => __( 'Password', 'nexpay' ),
+		);
+	}
+
+	/**
 	 * Checkout field: bKash mobile number.
 	 */
 	protected function render_checkout_fields() {
@@ -103,13 +120,41 @@ class NexPay_Gateway_BKash extends NexPay_Gateway {
 	 * @return bool
 	 */
 	public function validate_fields() {
-		$mobile = preg_replace( '/\D+/', '', $this->posted_field( 'nexpay_bkash_mobile' ) );
-
-		if ( ! preg_match( '/^01[3-9]\d{8}$/', $mobile ) ) {
+		if ( ! self::is_valid_bd_mobile( $this->posted_field( 'nexpay_bkash_mobile' ) ) ) {
 			wc_add_notice( __( 'Please enter a valid bKash mobile number (e.g. 01XXXXXXXXX).', 'nexpay' ), 'error' );
 			return false;
 		}
 
+		return true;
+	}
+
+	/**
+	 * Verify a bKash /execute response before the order may be paid:
+	 * statusCode 0000, transactionStatus "Completed", a transaction id,
+	 * and amount + currency matching the order exactly.
+	 * Static so it can be unit tested.
+	 *
+	 * @param array  $result          Decoded execute response.
+	 * @param string $expected_amount Order total (decimal string).
+	 * @param string $expected_currency Expected currency (default BDT).
+	 * @return bool
+	 */
+	public static function execute_response_is_valid( array $result, $expected_amount, $expected_currency = 'BDT' ) {
+		if ( ! isset( $result['statusCode'] ) || '0000' !== (string) $result['statusCode'] ) {
+			return false;
+		}
+		if ( ! isset( $result['transactionStatus'] ) || 'Completed' !== $result['transactionStatus'] ) {
+			return false;
+		}
+		if ( empty( $result['trxID'] ) ) {
+			return false;
+		}
+		if ( ! isset( $result['amount'] ) || self::format_amount( $result['amount'] ) !== self::format_amount( $expected_amount ) ) {
+			return false;
+		}
+		if ( ! isset( $result['currency'] ) || strtoupper( (string) $result['currency'] ) !== strtoupper( (string) $expected_currency ) ) {
+			return false;
+		}
 		return true;
 	}
 
@@ -185,7 +230,7 @@ class NexPay_Gateway_BKash extends NexPay_Gateway {
 		$response = wp_remote_post(
 			$this->base_url() . $path,
 			array(
-				'timeout' => 45,
+				'timeout' => 30,
 				'headers' => array(
 					'Content-Type'  => 'application/json',
 					'Accept'        => 'application/json',
@@ -280,15 +325,23 @@ class NexPay_Gateway_BKash extends NexPay_Gateway {
 		}
 
 		if ( ! $order->is_paid() ) {
+			// Execute at most once successfully per payment: once a
+			// verified execute has completed the order, any repeated
+			// callback short-circuits here instead of re-executing.
+			if ( 'yes' === (string) $order->get_meta( '_nexpay_bkash_executed' ) ) {
+				wp_safe_redirect( $this->get_return_url( $order ) );
+				exit;
+			}
+
 			$result = $this->api_request( '/execute', array( 'paymentID' => $payment_id ) );
 
-			$ok = is_array( $result )
-				&& isset( $result['statusCode'] ) && '0000' === (string) $result['statusCode']
-				&& isset( $result['transactionStatus'] ) && 'Completed' === $result['transactionStatus'];
+			$ok = is_array( $result ) && self::execute_response_is_valid( $result, (string) $order->get_total(), 'BDT' );
 
 			if ( $ok ) {
-				$order->payment_complete( isset( $result['trxID'] ) ? $result['trxID'] : $payment_id );
-				$order->add_order_note( sprintf( 'bKash payment executed (trxID: %s).', isset( $result['trxID'] ) ? $result['trxID'] : $payment_id ) );
+				$order->update_meta_data( '_nexpay_bkash_executed', 'yes' );
+				$order->save();
+				$order->payment_complete( $result['trxID'] );
+				$order->add_order_note( sprintf( 'bKash payment executed and verified (trxID: %s).', $result['trxID'] ) );
 				$this->log( 'Payment executed for order #' . $order->get_id() );
 			} else {
 				$this->log( 'Execute failed for order #' . $order->get_id() . ': ' . wp_json_encode( $result ), 'error' );
